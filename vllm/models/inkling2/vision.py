@@ -23,7 +23,6 @@ from vllm.models.inkling2.ops.vision import (
     gather_patches,
     scaled_residual_norm_,
 )
-from vllm.third_party.tml_fa4 import flash_attn_varlen_func
 
 _CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 _CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -58,6 +57,10 @@ class Inkling2VisionAttention(nn.Module):
         self.out_proj = _linear(width, width)
 
     def forward(self, hidden: torch.Tensor, metadata: VisionMetadata) -> torch.Tensor:
+        # Imported on use, so that the text model loads where tml_fa4 is not
+        # installed (it only runs on Blackwell).
+        from vllm.third_party.tml_fa4 import flash_attn_varlen_func
+
         qkv = self.qkv_proj(hidden)
         apply_rotary_qk_(qkv, metadata.meta, self.num_heads)
         q, k, v = qkv.view(-1, 3, self.num_heads, self.head_dim).unbind(1)

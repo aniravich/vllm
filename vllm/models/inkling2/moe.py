@@ -24,6 +24,7 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from .ops.activation import swiglu_quantize
 from .ops.block_scales import shuffle_rows, swizzle_block_scales
+from .ops.device import is_blackwell
 from .ops.moe import NUM_COUNTERS, combine, combine_push, route
 from .ops.seq_parallel import SeqParallel
 from .ops.trtllm_bmm import bmm, expert_plan, load_kernels
@@ -84,6 +85,13 @@ class Inkling2Gate(nn.Module):
 class Inkling2Experts(nn.Module):
     def __init__(self, config, quant_format: QuantFormat) -> None:
         super().__init__()
+        if not is_blackwell():
+            raise ValueError(
+                f"Inkling2 {quant_format} experts need a Blackwell GPU (SM100). "
+                "Other GPUs serve checkpoints whose routed experts are bf16: "
+                "hf_quant_config.json lists their w13_weight / w2_weight "
+                "under compute_dtype bfloat16."
+            )
         self.ep_rank = get_tensor_model_parallel_rank()
         self.ep_size = get_tensor_model_parallel_world_size()
         assert config.n_routed_experts % self.ep_size == 0
