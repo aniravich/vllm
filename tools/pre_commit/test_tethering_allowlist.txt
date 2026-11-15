@@ -51,6 +51,10 @@ tests/models/inkling2/test_dspark.py  # Inkling2 B200 tests; CI job not added ye
 tests/models/inkling2/test_processing.py  # Inkling2 B200 tests; CI job not added yet
 tests/models/inkling2/test_allreduce.py  # Inkling2 B200 tests; CI job not added yet
 tests/models/inkling2/test_vision.py  # Inkling2 B200 tests; CI job not added yet
+tests/models/inkling2/test_bf16_moe.py  # Inkling2 bf16 experts, CPU and GPU tests; CI job not added yet
+tests/models/inkling2/test_model_bf16.py  # Inkling2 bf16 experts end to end, GPU test; CI job not added yet
+tests/models/inkling2/test_score_mod_attention.py  # Inkling2 attention on standard FA4, CPU and GPU tests; CI job not added yet
+tests/models/inkling2/test_weight_loading.py  # Inkling2 loading and weight updates, CPU tests; CI job not added yet
 
 # tests/lora/ - explicitly --ignore'd from the sharded LoRA run, with no
 # dedicated *_tp job (unlike the other ignored *_tp tests).

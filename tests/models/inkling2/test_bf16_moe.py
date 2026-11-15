@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inkling2 bf16 experts on FusedMoE: the routing, how the stacked checkpoint
-tensors are loaded, and (on a GPU) the layer against an fp64 reference."""
+tensors are loaded, and (on a GPU) the layer against an fp64 reference and
+with padding rows."""
 
 from types import SimpleNamespace
 
@@ -317,32 +318,58 @@ def test_padding_rows_are_routed_to_no_expert(monkeypatch):
     assert torch.equal(weights, ref_weights)
 
 
+# Softcaps of the GPU tests. Their pre-activations stay below 4.5, where the
+# release's up cap of 25 changes less than the kernels' bf16 rounding does, so
+# that a layer without it would pass. Both of these bite.
+GATE_CAP, UP_CAP = 1.5, 1.0
+
+
+def _gpu_layer():
+    """The layer on FusedMoE's GPU kernels, loaded from checkpoint-layout
+    tensors. Returns it, the tensors, and a function that runs it on `x`
+    with an optional padding mask in the forward context."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+
+    vllm_config = VllmConfig()
+    vllm_config.compilation_config.static_forward_context = dict()
+    config = SimpleNamespace(
+        **{**vars(CONFIG), "mlp_gate_softcap": GATE_CAP, "mlp_up_softcap": UP_CAP}
+    )
+    w13, w2 = _checkpoint_experts()
+    w13, w2 = (w13 * 0.2).cuda(), (w2 * 0.2).cuda()
+    with set_current_vllm_config(vllm_config):
+        moe = Inkling2BF16MoE(config, "model.layers.0.mlp").cuda()
+        # Drawn on the CPU, so that every GPU runs the same inputs.
+        moe.gate.weight.data.copy_(torch.randn(NUM_EXPERTS, HIDDEN) * 0.3)
+        moe.gate.bias.data.copy_(torch.randn(NUM_EXPERTS) * 0.05)
+        moe.load_expert_weight("w13_weight", w13)
+        moe.load_expert_weight("w2_weight", w2)
+        experts = moe.experts.routed_experts
+        experts.quant_method.process_weights_after_loading(experts)
+
+    def forward(x, is_padding=None):
+        with (
+            set_current_vllm_config(vllm_config),
+            set_forward_context(
+                None, vllm_config, num_tokens=x.shape[0], is_padding=is_padding
+            ),
+        ):
+            return moe(x)
+
+    return moe, w13, w2, forward
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 7, 300])
 @torch.inference_mode()
 def test_bf16_moe_matches_reference(num_tokens, dist_init, workspace_init):
     """The layer on FusedMoE's kernels, loaded from checkpoint-layout
     tensors, against one expert at a time in fp64."""
-    from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.forward_context import set_forward_context
-
-    torch.manual_seed(0)
-    vllm_config = VllmConfig()
-    vllm_config.compilation_config.static_forward_context = dict()
-    w13, w2 = _checkpoint_experts()
-    w13, w2 = (w13 * 0.2).cuda(), (w2 * 0.2).cuda()
+    moe, w13, w2, forward = _gpu_layer()
     x = (torch.randn(num_tokens, HIDDEN) * 0.5).bfloat16().cuda()
 
-    with set_current_vllm_config(vllm_config):
-        moe = Inkling2BF16MoE(CONFIG, "model.layers.0.mlp").cuda()
-        moe.gate.weight.data.normal_(std=0.3)
-        moe.gate.bias.data.normal_(std=0.05)
-        moe.load_expert_weight("w13_weight", w13)
-        moe.load_expert_weight("w2_weight", w2)
-        experts = moe.experts.routed_experts
-        experts.quant_method.process_weights_after_loading(experts)
-        with set_forward_context(None, vllm_config, num_tokens=num_tokens):
-            out = moe(x)
+    out = forward(x)
 
     assert out.shape == x.shape and out.dtype == torch.bfloat16
     xd = x.double()
@@ -353,7 +380,40 @@ def test_bf16_moe_matches_reference(num_tokens, dist_init, workspace_init):
         gate, up = (
             (w13[expert_id].double() @ xd.t()).t().unflatten(1, (-1, 2)).unbind(2)
         )
-        hidden = 4 * torch.tanh(gate / 4) * torch.sigmoid(gate)
-        hidden = hidden * 25 * torch.tanh(up / 25)
+        hidden = GATE_CAP * torch.tanh(gate / GATE_CAP) * torch.sigmoid(gate)
+        hidden = hidden * UP_CAP * torch.tanh(up / UP_CAP)
         ref += weights[:, expert_id, None] * (hidden @ w2[expert_id].double().t())
-    torch.testing.assert_close(out.double(), ref, atol=2e-2, rtol=2e-2)
+    # The kernels round to bf16 four times: each GEMM, the activation and the
+    # sum over the experts of a token.
+    torch.testing.assert_close(out.double(), ref, atol=5e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize(("num_tokens", "num_real"), [(8, 3), (300, 256)])
+@torch.inference_mode()
+def test_bf16_moe_padding_leaves_the_other_rows_unchanged(
+    num_tokens, num_real, dist_init, workspace_init
+):
+    """Rows the forward context marks as padding (CUDA graph and
+    data-parallel padding) go to no expert. The rows before them come out as
+    they do without it; the padding rows only have to differ from it: without
+    an expert map they hold whatever FusedMoE's workspace held."""
+    _, _, _, forward = _gpu_layer()
+    x = (torch.randn(num_tokens, HIDDEN) * 0.5).bfloat16().cuda()
+    is_padding = (torch.arange(num_tokens) >= num_real).cuda()
+
+    expected = forward(x)
+    # FusedMoE writes nothing for a row that goes to no expert and sums what
+    # its workspace holds there, which would be the right values left by the
+    # run above: overwrite them, so a real row that got skipped comes out
+    # wrong.
+    forward(-x)
+    out = forward(x, is_padding)
+
+    # Each row is computed on its own, so the real rows should be equal; the
+    # tolerance, a few bf16 steps and far below what a skipped row is off by,
+    # allows for a kernel that orders a row's sums by the batch.
+    torch.testing.assert_close(out[:num_real], expected[:num_real], rtol=0, atol=5e-2)
+    # The mask took effect: no padding row was computed.
+    computed = (out[num_real:] == expected[num_real:]).all(dim=1)
+    assert not computed.any(), computed.nonzero().flatten().tolist()

@@ -22,18 +22,34 @@ from vllm.models.inkling2.ops.fa4_rel_attention import (
     unshear_rel_logits,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import gl
 
 _cap = current_platform.get_device_capability() if current_platform.is_cuda() else None
-# Standard FA4 takes a custom score-mod from SM90 on.
+# Standard FA4 takes a score-mod with paged KV on SM90, SM100 and SM110 only.
 requires_sm90 = pytest.mark.skipif(
-    _cap is None or _cap.major < 9, reason="FA4 score-mod requires SM90 or newer"
+    _cap is None or _cap.major not in (9, 10, 11),
+    reason="FA4 score-mod with paged KV requires SM90, SM100 or SM110",
+)
+# `vllm.models.inkling2.attention` builds its Gluon kernels at import, which
+# vLLM's Triton placeholders (a host without an active GPU driver) cannot.
+requires_gluon = pytest.mark.skipif(
+    not hasattr(gl, "nvidia"), reason="Inkling2 attention needs Triton's Gluon"
 )
 
 UNSHEAR_SCENARIOS = {
     **SCENARIOS,
     "mixed": [(1, 4000), (1, 1), (129, 129), (128, 128), (127, 4127), (256, 1280)],
-    # Query tiles and key blocks are 128 wide.
-    "boundaries": [(1, 128), (1, 129), (1, 127), (128, 256), (129, 257), (255, 255)],
+    # Query tiles and key blocks are 128 wide. The first row of (128, 129) has
+    # the largest offset of a real token, 254.
+    "boundaries": [
+        (1, 128),
+        (1, 129),
+        (1, 127),
+        (128, 129),
+        (128, 256),
+        (129, 257),
+        (255, 255),
+    ],
 }
 FA4_SCENARIOS = {
     **SCENARIOS,
@@ -92,26 +108,36 @@ def test_unshear_rel_logits(scenario, is_local, extent):
 @pytest.mark.skip_global_cleanup
 def test_unshear_reads_padding_rows_in_bounds():
     """A full CUDA graph un-shears its padding rows too: they map to request
-    0 past its queries, where the prologue clamps the diagonal."""
+    0 past its queries, where the prologue clamps the diagonal. Without the
+    same clamp their offsets go negative, and in a large graph out of the
+    un-shear's range."""
     torch.manual_seed(0)
-    seqs = [(1, 900), (1, 3000), (1, 1)]
+    # 3 decodes replayed in a 512-request graph: enough padding rows for an
+    # unclamped offset to leave the un-shear's range. Request 0 fills its last
+    # key block, so the diagonal of every padding row is past the last column.
+    seqs = [(1, 128), (1, 3000), (1, 1)]
+    num_tokens, num_padding = len(seqs), 509
     seq_idx, cu_seqlens_q, seq_lens = _request_metadata(
-        seqs, num_padding_tokens=5, num_padding_reqs=5
+        seqs, num_padding_tokens=num_padding, num_padding_reqs=num_padding
     )
-    rel_logits = torch.randn(3, 2, REL_EXTENT, dtype=torch.bfloat16)
-    sheared = shear_rel_logits(rel_logits, seqs, 128, True)
+    rel_logits = torch.randn(num_tokens, 2, REL_EXTENT, dtype=torch.bfloat16)
     # The rows of the padding tokens hold whatever the prologue wrote.
-    sheared[3:8] = 7.0
+    sheared = torch.full(
+        (num_tokens + num_padding + 128, 2, REL_EXTENT + 256), 7.0, dtype=torch.bfloat16
+    )
+    sheared[:num_tokens] = shear_rel_logits(rel_logits, seqs, 128, True)[:num_tokens]
 
     offsets = diagonal_offsets(seq_idx, cu_seqlens_q, seq_lens)
     out = unshear_rel_logits(sheared, offsets)
 
-    assert offsets.shape == (8,)
+    assert offsets.shape == (num_tokens + num_padding,)
     assert int(offsets.min()) >= 0
     assert int(offsets.max()) <= 254
-    assert out.shape == (8, 2, REL_EXTENT)
-    assert torch.equal(out[:3], rel_logits)
-    assert torch.equal(out[3:], torch.full_like(out[3:], 7.0))
+    # The prologue clamps the diagonal of these rows to its last column.
+    assert offsets[num_tokens:].count_nonzero() == 0
+    assert out.shape == (num_tokens + num_padding, 2, REL_EXTENT)
+    assert torch.equal(out[:num_tokens], rel_logits)
+    assert torch.equal(out[num_tokens:], torch.full_like(out[num_tokens:], 7.0))
 
 
 def _dense_fa4(
@@ -153,6 +179,7 @@ def _dense_fa4(
     return lse
 
 
+@requires_gluon
 @pytest.mark.cpu_test
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize("graph", ["none", "piecewise", "full"])
@@ -162,15 +189,15 @@ def test_score_mod_attention_zeroes_padding_rows(monkeypatch, graph, window_left
     padding: piecewise graphs pad the tokens after `num_actual_tokens`; a
     full graph counts its padding in `num_actual_tokens` and pads the
     requests."""
-    # The attention module builds its Gluon kernels at import.
-    pytest.importorskip("triton")
     import vllm.models.inkling2.attention as attention_module
     from vllm.models.inkling2.attention import Inkling2Attention
 
     torch.manual_seed(0)
     monkeypatch.setattr(attention_module, "fa4_rel_attention", _dense_fa4)
     num_heads, num_kv_heads, block_size = 6, 1, 16
-    seqs = [(1, 900), (1, 3000), (1, 1), (1, 1025)]
+    # Request 0 fills its last key block, so the padding rows of a full graph
+    # (request 0, past its query) need the clamp of `diagonal_offsets`.
+    seqs = [(1, 128), (1, 3000), (1, 1), (1, 1025)]
     num_tokens = len(seqs)
     padding = 0 if graph == "none" else 4
     max_blocks = -(-max(kv_len for _, kv_len in seqs) // block_size)
@@ -198,13 +225,14 @@ def test_score_mod_attention_zeroes_padding_rows(monkeypatch, graph, window_left
     block_table = torch.cat(
         [block_table, torch.zeros(padding_reqs, max_blocks, dtype=torch.int32)]
     )
-    md = SimpleNamespace(
+    md = attention_module.Inkling2AttentionMetadata(
         num_actual_tokens=num_tokens + (padding if graph == "full" else 0),
-        rel_offsets=None,
+        max_query_len=1,
         query_start_loc=cu_seqlens_q,
+        max_seq_len=max(kv_len for _, kv_len in seqs),
         seq_lens=seq_lens,
         block_table=block_table,
-        max_query_len=1,
+        slot_mapping=torch.empty(0, dtype=torch.long),
     )
     layer = SimpleNamespace(
         num_heads=num_heads,
@@ -237,6 +265,9 @@ def test_score_mod_attention_zeroes_padding_rows(monkeypatch, graph, window_left
     # The offsets are kept for the other layers that share the metadata.
     assert md.rel_offsets is not None
     assert md.rel_offsets.shape == (md.num_actual_tokens,)
+    # A full graph's padding rows take the prologue's clamp: a negative
+    # offset would wrap in the un-shear without a visible effect here.
+    assert md.rel_offsets[num_tokens:].count_nonzero() == 0
     kept = md.rel_offsets
     Inkling2Attention._score_mod_attention(
         layer, md, SimpleNamespace(seq_idx=None), q, sheared
@@ -378,3 +409,81 @@ def test_fa4_rel_attention_window_over_freed_blocks(block_size):
     )
     torch.testing.assert_close(out.float(), ref_out, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(lse.t(), ref_lse, atol=1e-3, rtol=1e-4)
+
+
+@requires_sm90
+@pytest.mark.parametrize("window_left", [None, REL_EXTENT - 1])
+# FA4 finds a tile's request another way in batches of more than 256.
+@pytest.mark.parametrize("scenario,graph_reqs", [("decode", 8), ("many_decodes", 512)])
+@torch.inference_mode()
+def test_fa4_rel_attention_with_full_graph_padding(scenario, graph_reqs, window_left):
+    """What `_score_mod_attention` hands FA4 in a full CUDA graph: token rows
+    after the batch's, and empty requests whose page-table rows are the null
+    block. FA4 has to compute the real rows and leave the others of `out` as
+    they are, which is where the zeros of the padding rows come from."""
+    torch.manual_seed(0)
+    device = "cuda"
+    num_heads, num_kv_heads, block_size = 6, 1, 256
+    seqs = FA4_SCENARIOS[scenario]
+    num_tokens = len(seqs)
+    num_padding = graph_reqs - num_tokens
+    max_blocks = -(-max(kv_len for _, kv_len in seqs) // block_size)
+    num_blocks = len(seqs) * max_blocks + 1
+    kv = torch.randn(num_blocks, block_size, num_kv_heads, 2 * HEAD_DIM, device=device)
+    kv[..., :HEAD_DIM] = torch.nn.functional.normalize(kv[..., :HEAD_DIM], dim=-1) * 2
+    key_cache, value_cache = kv.bfloat16().split(HEAD_DIM, dim=-1)
+    block_table = (
+        (torch.randperm(num_blocks - 1, device=device) + 1)[: len(seqs) * max_blocks]
+        .view(len(seqs), max_blocks)
+        .int()
+    )
+    padded_table = torch.cat(
+        [block_table, block_table.new_zeros(num_padding, max_blocks)]
+    )
+    q = torch.randn(num_tokens + num_padding, num_heads, HEAD_DIM, device=device)
+    q = (torch.nn.functional.normalize(q, dim=-1) * 3).bfloat16()
+    rel_logits = torch.randn(
+        num_tokens, num_heads, REL_EXTENT, device=device, dtype=torch.bfloat16
+    )
+    sheared = rel_logits.new_zeros(
+        num_tokens + num_padding + 128, num_heads, REL_EXTENT + 256
+    )
+    sheared[:num_tokens] = shear_rel_logits(
+        rel_logits, seqs, 128, window_left is not None
+    )[:num_tokens]
+    seq_idx, cu_seqlens_q, seq_lens = _request_metadata(
+        seqs, device, num_padding_tokens=num_padding, num_padding_reqs=num_padding
+    )
+    scale = HEAD_DIM**-0.5
+
+    # A sentinel shows a write to the rows after the batch's tokens.
+    out = torch.full_like(q, 7.0)
+    lse = fa4_rel_attention(
+        q,
+        key_cache,
+        value_cache,
+        unshear_rel_logits(sheared, diagonal_offsets(seq_idx, cu_seqlens_q, seq_lens)),
+        block_table=padded_table,
+        cache_seqlens=seq_lens,
+        cu_seqlens_q=cu_seqlens_q,
+        max_query_len=1,
+        softmax_scale=scale,
+        window_size=(-1, -1) if window_left is None else (window_left, 0),
+        out=out,
+    )
+
+    ref_out, ref_lse = _ref_attention(
+        q[:num_tokens],
+        key_cache,
+        value_cache,
+        rel_logits,
+        seqs,
+        block_table,
+        scale,
+        window_left,
+    )
+    assert lse.shape == (num_heads, num_tokens + num_padding)
+    torch.testing.assert_close(out[:num_tokens].float(), ref_out, atol=2e-2, rtol=2e-2)
+    # FA4 leaves the LSE of the rows after the batch's tokens unwritten.
+    torch.testing.assert_close(lse.t()[:num_tokens], ref_lse, atol=1e-3, rtol=1e-4)
+    assert torch.equal(out[num_tokens:], torch.full_like(out[num_tokens:], 7.0))
