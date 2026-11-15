@@ -291,6 +291,68 @@ def test_short_conv_chunked_matches_full_sequence(fused_residual, steps):
         torch.testing.assert_close(torch.cat(outs[i]), ref, atol=0, rtol=1e-2)
 
 
+@pytest.mark.parametrize("num_reqs", [5, 6, 7, 8, 37])
+def test_short_conv_reads_the_cache_next_to_padding_rows(num_reqs):
+    """A decode batch padded past 256 rows (CUDA graph or data-parallel
+    padding) takes the prefill tiling, whose tiles skip the conv-state cache
+    when none of their tokens starts a request. The padding rows (no cache
+    slot, request 0, request start 0) must not make the tile they share with
+    the last decode tokens skip it."""
+    width, block, heads, stream_width, offset, row = 4, 4, 2, 128, 128, 1024
+    channels = heads * stream_width
+    cached, padded = 6, 300
+    xs = torch.randn(num_reqs, cached + 1, channels, device=DEVICE).bfloat16()
+    weight = torch.randn(channels, width, device=DEVICE).bfloat16()
+    blocks_per_req = 4
+    num_blocks = num_reqs * blocks_per_req
+    cache = torch.zeros(num_blocks + 1, heads, block, row, device=DEVICE).bfloat16()
+    block_table = (torch.randperm(num_blocks, device=DEVICE) + 1).int()
+    block_table = block_table.view(num_reqs, blocks_per_req)
+    reqs = torch.arange(num_reqs, device=DEVICE)
+
+    # The first `cached` tokens of every request, in one forward.
+    positions = torch.arange(cached, device=DEVICE).repeat(num_reqs)
+    seq_idx = reqs.repeat_interleave(cached)
+    slots = block_table[seq_idx, positions // block].long() * block + positions % block
+    short_conv(
+        xs[:, :cached].reshape(-1, channels),
+        weight,
+        cache,
+        positions,
+        block_table,
+        seq_idx.int(),
+        slots,
+        (seq_idx * cached).int(),
+        offset,
+        stream_width,
+    )
+
+    # One decode token per request, then padding rows.
+    x = torch.zeros(padded, channels, device=DEVICE).bfloat16()
+    x[:num_reqs] = xs[:, cached]
+    positions = torch.zeros(padded, dtype=torch.long, device=DEVICE)
+    positions[:num_reqs] = cached
+    seq_idx = torch.zeros(padded, dtype=torch.int32, device=DEVICE)
+    seq_idx[:num_reqs] = reqs
+    slots = torch.full((padded,), -1, dtype=torch.long, device=DEVICE)
+    slots[:num_reqs] = block_table[:, cached // block].long() * block + cached % block
+    out = short_conv(
+        x,
+        weight,
+        cache,
+        positions,
+        block_table,
+        seq_idx,
+        slots,
+        seq_idx.clone(),
+        offset,
+        stream_width,
+    )
+
+    ref = torch.stack([_dense_conv(xs[i], weight, None)[cached] for i in reqs])
+    torch.testing.assert_close(out[:num_reqs], ref, atol=0, rtol=1e-2)
+
+
 @pytest.mark.parametrize(
     "num_stack,num_q,with_last,with_residual",
     [
