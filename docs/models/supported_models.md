@@ -699,6 +699,17 @@ Some models are supported only via the [Transformers modeling backend](#transfor
     `Gemma3nForConditionalGeneration` is only supported on V1 due to shared KV caching and it depends on `timm>=1.0.17` to make use of its
     MobileNet-v5 vision backbone.
 
+!!! note
+    `Inkling2ForConditionalGeneration` builds each layer's routed experts from the
+    checkpoint's `hf_quant_config.json`. The NVFP4 and MXFP8 experts of
+    `thinkingmachines/Inkling-2-Small` need a Blackwell GPU. Experts listed there under
+    `compute_dtype: bfloat16` run from Hopper (SM90) on and can be updated in place
+    ([Async RL](../training/async_rl.md)). They take about 1.1 TB, so they are served
+    with expert parallelism over 16 GPUs:
+    `--tensor-parallel-size 8 --data-parallel-size 2 --enable-expert-parallel`.
+    Off Blackwell only the text path is covered: pass
+    `--limit-mm-per-prompt '{"image": 0}'` and no speculative config.
+
     Performance is not yet fully optimized mainly due to:
 
     - Both audio and vision MM encoders use `transformers.AutoModel` implementation.
