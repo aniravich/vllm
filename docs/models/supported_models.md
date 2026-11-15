@@ -729,8 +729,10 @@ Some models are supported only via the [Transformers modeling backend](#transfor
     `--nnodes 2 --node-rank <0|1> --master-addr <head node IP>` on each of two 8-GPU
     nodes and `--headless` on the second
     ([multi-node deployment](../serving/parallelism_scaling.md#running-vllm-with-multiprocessing)).
-    Off Blackwell only the text path is covered: pass
-    `--limit-mm-per-prompt '{"image": 0}'` and no speculative config.
+    A weight update sends each layer's stacked expert tensors to every GPU: leave
+    about 25 GiB per GPU free for it, for example with `--gpu-memory-utilization 0.80`
+    on an H200. Off Blackwell only the text path is covered: the vision tower and the
+    DSpark draft are refused, so pass `--limit-mm-per-prompt '{"image": 0}'`.
 
 !!! note
     For `InternVLChatModel`, only InternVL2.5 with Qwen2.5 text backbone (`OpenGVLab/InternVL2.5-1B` etc.), InternVL3 and InternVL3.5 have video inputs support currently.
