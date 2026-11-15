@@ -64,6 +64,7 @@ from .moe import Inkling2MoE
 from .ops.allreduce import Inkling2AllReduceWorkspace
 from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
+from .ops.device import is_blackwell
 from .ops.norm import rms_norm
 from .ops.seq_parallel import SeqParallel
 from .processing import (
@@ -505,11 +506,27 @@ class Inkling2ForConditionalGeneration(
             raise ValueError("Inkling2 does not support prompt embeddings")
         self.config = config
         self.text_config = text_config = config.text_config
+        mm_config = vllm_config.model_config.multimodal_config
+        with_vision = (
+            config.vision_config is not None
+            and mm_config is not None
+            and bool(mm_config.get_limit_per_prompt("image"))
+        )
+        speculative = vllm_config.speculative_config
+        if not is_blackwell():
+            # The vision tower and the DSpark draft have SM100-only attention.
+            if with_vision:
+                raise ValueError(
+                    "Inkling2's vision tower needs a Blackwell GPU (SM100): pass "
+                    "--limit-mm-per-prompt '{\"image\": 0}' to serve text only"
+                )
+            if speculative is not None and speculative.method == "dspark":
+                raise ValueError(
+                    "Inkling2's DSpark draft needs a Blackwell GPU (SM100)"
+                )
         self.visual = (
             Inkling2VisionEncoder(config.vision_config, text_config.hidden_size)
-            if config.vision_config is not None
-            and vllm_config.model_config.multimodal_config is not None
-            and vllm_config.model_config.multimodal_config.get_limit_per_prompt("image")
+            if with_vision
             else None
         )
         self.model = Inkling2Model(text_config, quant_config, f"{prefix}model")
@@ -738,7 +755,9 @@ class Inkling2ForConditionalGeneration(
                 if m is not None and int(m.group(2)) >= layer_limits[m.group(1)]:
                     continue
                 raise ValueError(f"Unexpected checkpoint tensor: {name}")
-            param = params[name]
+            # Looked up per tensor: a layerwise weight reload swaps a module's
+            # parameters back in once it is complete.
+            param = self.get_parameter(name)
             if param.dtype != weight.dtype:
                 raise ValueError(
                     f"{name}: checkpoint dtype {weight.dtype} != {param.dtype}"
@@ -760,6 +779,15 @@ class Inkling2ForConditionalGeneration(
             if updating or count == num_shards[fused]:
                 loaded.add(name)
         if self.visual is not None:
+            if visual_weights and any(p.is_meta for p in self.visual.parameters()):
+                # The tower's loader writes to its parameters, which a
+                # layerwise reload has replaced by meta ones, all but the
+                # biases: it would end with new biases on old weights.
+                raise ValueError(
+                    "Inkling2's vision tower cannot be updated by a layerwise "
+                    "reload: leave model.visual.* out of the update, or set "
+                    "VLLM_RELOAD_MODE=direct"
+                )
             loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual_weights)}
         if not updating and (missing := params.keys() - loaded):
             raise ValueError(f"Missing checkpoint tensors: {sorted(missing)}")

@@ -45,7 +45,9 @@ def route(
     logits = logits.float()
     keys = torch.sigmoid(logits) + bias
     # A stable sort, for the tie rule (`torch.topk` leaves it open).
-    ids = keys.sort(dim=-1, descending=True, stable=True).indices[..., :topk]
+    order = keys.sort(dim=-1, descending=True, stable=True).indices
+    # FusedMoE's routers take contiguous ids.
+    ids = order[..., :topk].contiguous()
     selected = nn.functional.logsigmoid(logits.gather(-1, ids))
     return torch.softmax(selected, dim=-1) * route_scale, ids
 
@@ -125,8 +127,8 @@ class Inkling2BF16MoE(nn.Module):
         del hidden_states, renormalize
         assert topk == self.topk
         weights, ids = route(gating_output, self.gate.bias, topk, self.route_scale)
-        # CUDA graph and data-parallel padding rows go to no expert (and come
-        # out as 0), as with FusedMoE's own routers.
+        # CUDA graph and data-parallel padding rows go to no expert, as with
+        # FusedMoE's own routers.
         is_padding = get_moe_padding_mask(ids.shape[0])
         if is_padding is not None and is_padding.shape[0] == ids.shape[0]:
             ids = ids.masked_fill(is_padding[:, None], -1)
@@ -160,19 +162,19 @@ class Inkling2BF16MoE(nn.Module):
                 f"Unexpected tensor for bf16 Inkling2 experts: experts.{name} "
                 "(a quantized checkpoint?)"
             )
-        param = getattr(experts, name)
-        if weight.dtype != param.dtype or weight.shape != shapes[name]:
+        dtype = getattr(experts, name).dtype
+        if weight.dtype != dtype or weight.shape != shapes[name]:
             raise ValueError(
                 f"experts.{name}: checkpoint {weight.dtype} {tuple(weight.shape)} "
-                f"!= {param.dtype} {shapes[name]}"
+                f"!= {dtype} {shapes[name]}"
             )
-        loader = param.weight_loader
         expert_map = experts.expert_map_manager.expert_map
         local_ids = (
             range(self.num_experts)
             if expert_map is None
             else [e for e, slot in enumerate(expert_map.tolist()) if slot >= 0]
         )
+        shards: tuple[tuple[str, torch.Tensor], ...]
         for expert_id in local_ids:
             expert = weight[expert_id]
             if name == _W13:
@@ -180,8 +182,16 @@ class Inkling2BF16MoE(nn.Module):
             else:
                 shards = (("w2", expert),)
             for shard_id, shard in shards:
+                # Looked up per call: a layerwise weight reload buffers the
+                # calls on a meta parameter, and swaps the real one back in
+                # once the layer is complete.
+                param = getattr(experts, name)
+                if expert_map is not None and param.is_meta:
+                    # The buffered call would keep the whole stacked tensor
+                    # alive for the share of it this rank owns.
+                    shard = shard.clone()
                 # The loader reports a skipped tensor instead of raising.
-                if not loader(
+                if not param.weight_loader(
                     param, shard, name, shard_id, expert_id, return_success=True
                 ):
                     raise ValueError(
