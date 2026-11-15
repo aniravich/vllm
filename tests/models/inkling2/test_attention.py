@@ -33,10 +33,10 @@ def shear_rel_logits(rel_logits, seqs, tile, is_local):
     """Torch reference of the sheared layout `attention_prologue` writes.
 
     Token `i` of a request with `past` cached keys sits in a tile of
-    `tile` query tokens whose key blocks end at `n_max`; column `c` holds
-    key `c + (n_max - 10) * 128`, padded with -inf right of the diagonal and
-    -inf (window) or 0 past the extent (also for keys before the sequence,
-    which no kernel reads).
+    `tile` query tokens whose key blocks end at `n_max`; column `c` of the
+    `extent + 256` holds key `c + n_max * 128 - (extent + 256)`, padded with
+    -inf right of the diagonal and -inf (window) or 0 past the extent (also
+    for keys before the sequence, which no kernel reads).
     """
     tokens, heads, extent = rel_logits.shape
     out = rel_logits.new_full((tokens + 128, heads, extent + 256), float("nan"))
@@ -47,7 +47,7 @@ def shear_rel_logits(rel_logits, seqs, tile, is_local):
         pos = kv_len - q_len + idx
         tile_end = ((idx // tile + 1) * tile).clamp(max=q_len)
         n_max = (kv_len - q_len + tile_end + 127) // 128
-        dist = pos[:, None] - (cols[None] + (n_max[:, None] - 10) * 128)
+        dist = pos[:, None] - (cols[None] + n_max[:, None] * 128 - (extent + 256))
         valid = (dist >= 0) & (dist < extent)
         rel = rel_logits[start : start + q_len]
         vals = rel.gather(2, dist.clamp(0, extent - 1)[:, None].expand(-1, heads, -1))

@@ -699,17 +699,6 @@ Some models are supported only via the [Transformers modeling backend](#transfor
     `Gemma3nForConditionalGeneration` is only supported on V1 due to shared KV caching and it depends on `timm>=1.0.17` to make use of its
     MobileNet-v5 vision backbone.
 
-!!! note
-    `Inkling2ForConditionalGeneration` builds each layer's routed experts from the
-    checkpoint's `hf_quant_config.json`. The NVFP4 and MXFP8 experts of
-    `thinkingmachines/Inkling-2-Small` need a Blackwell GPU. Experts listed there under
-    `compute_dtype: bfloat16` run from Hopper (SM90) on and can be updated in place
-    ([Async RL](../training/async_rl.md)). They take about 1.1 TB, so they are served
-    with expert parallelism over 16 GPUs:
-    `--tensor-parallel-size 8 --data-parallel-size 2 --enable-expert-parallel`.
-    Off Blackwell only the text path is covered: pass
-    `--limit-mm-per-prompt '{"image": 0}'` and no speculative config.
-
     Performance is not yet fully optimized mainly due to:
 
     - Both audio and vision MM encoders use `transformers.AutoModel` implementation.
@@ -728,6 +717,20 @@ Some models are supported only via the [Transformers modeling backend](#transfor
     - This is the encoder-free Gemma 4 variant (e.g. `gemma-4-12B-it`). Unlike the tower-based `Gemma4ForConditionalGeneration`, it has **no SigLIP vision encoder** and **no audio encoder**. Raw pixel patches are projected directly into LM space via a Dense+LayerNorm pipeline with factorized positional embeddings, and raw audio waveform frames are projected directly through a multimodal embedder.
     - All modalities (image, video, audio) are supported.
     - Gemma 4 Unified assistant checkpoints (`model_type: gemma4_unified_assistant`) use the same MTP path as the tower-based variant. See the [Gemma 4 assistant model MTP example](../features/speculative_decoding/mtp.md#gemma-4-assistant-models).
+
+!!! note
+    `Inkling2ForConditionalGeneration` builds each layer's routed experts from the
+    checkpoint's `hf_quant_config.json`. The NVFP4 and MXFP8 experts of
+    `thinkingmachines/Inkling-2-Small` need a Blackwell GPU. Experts listed there under
+    `compute_dtype: bfloat16` run from Hopper (SM90) on and can be updated in place
+    ([Async RL](../training/async_rl.md)). They take about 1.1 TB, so they are served
+    with expert parallelism over 16 GPUs:
+    `--tensor-parallel-size 8 --data-parallel-size 2 --enable-expert-parallel`, with
+    `--nnodes 2 --node-rank <0|1> --master-addr <head node IP>` on each of two 8-GPU
+    nodes and `--headless` on the second
+    ([multi-node deployment](../serving/parallelism_scaling.md#running-vllm-with-multiprocessing)).
+    Off Blackwell only the text path is covered: pass
+    `--limit-mm-per-prompt '{"image": 0}'` and no speculative config.
 
 !!! note
     For `InternVLChatModel`, only InternVL2.5 with Qwen2.5 text backbone (`OpenGVLab/InternVL2.5-1B` etc.), InternVL3 and InternVL3.5 have video inputs support currently.

@@ -35,6 +35,11 @@ UNSHEAR_SCENARIOS = {
     # Query tiles and key blocks are 128 wide.
     "boundaries": [(1, 128), (1, 129), (1, 127), (128, 256), (129, 257), (255, 255)],
 }
+FA4_SCENARIOS = {
+    **SCENARIOS,
+    # FA4 schedules batches of more than 256 requests with another kernel variant.
+    "many_decodes": [(1, 1 + 37 * i % 2000) for i in range(300)],
+}
 
 
 def _request_metadata(seqs, device="cpu", num_padding_tokens=0, num_padding_reqs=0):
@@ -62,13 +67,15 @@ def _request_metadata(seqs, device="cpu", num_padding_tokens=0, num_padding_reqs
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize("scenario", list(UNSHEAR_SCENARIOS))
 @pytest.mark.parametrize("is_local", [False, True])
-def test_unshear_rel_logits(scenario, is_local):
+# A local layer's extent is its window, which a config can shorten.
+@pytest.mark.parametrize("extent", [REL_EXTENT, 128])
+def test_unshear_rel_logits(scenario, is_local, extent):
     """Un-shearing the reference of what `attention_prologue` writes gives
     back the logits by distance, bit for bit."""
     torch.manual_seed(0)
     seqs = UNSHEAR_SCENARIOS[scenario]
     num_tokens = sum(q_len for q_len, _ in seqs)
-    rel_logits = torch.randn(num_tokens, 3, REL_EXTENT, dtype=torch.bfloat16)
+    rel_logits = torch.randn(num_tokens, 3, extent, dtype=torch.bfloat16)
     sheared = shear_rel_logits(rel_logits, seqs, 128, is_local)
     offsets = diagonal_offsets(*_request_metadata(seqs))
 
@@ -250,6 +257,8 @@ def test_score_mod_attention_zeroes_padding_rows(monkeypatch, graph, window_left
         (6, 1, 256, None, "chunked_prefill"),
         (6, 1, 256, REL_EXTENT - 1, "decode"),
         (6, 1, 256, None, "decode"),
+        (6, 1, 256, REL_EXTENT - 1, "many_decodes"),
+        (6, 1, 256, None, "many_decodes"),
         (12, 2, 128, REL_EXTENT - 1, "prefill"),
         (12, 2, 64, None, "decode"),
         (48, 8, 16, None, "prefill"),
@@ -265,7 +274,7 @@ def test_fa4_rel_attention(
     matches the fp32 reference, output and LSE."""
     torch.manual_seed(0)
     device = "cuda"
-    seqs = SCENARIOS[scenario]
+    seqs = FA4_SCENARIOS[scenario]
     q_lens = [q_len for q_len, _ in seqs]
     num_tokens = sum(q_lens)
     max_blocks = -(-max(kv_len for _, kv_len in seqs) // block_size)
