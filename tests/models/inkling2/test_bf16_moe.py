@@ -295,27 +295,41 @@ def test_fused_moe_arguments(monkeypatch):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.skip_global_cleanup
-def test_padding_rows_are_routed_to_no_expert(monkeypatch):
-    """FusedMoE skips rows whose expert ids are -1 (CUDA graph and
-    data-parallel padding); its own routers mark them the same way."""
-    moe, kwargs = _fake_moe(monkeypatch)
+def test_padding_rows_are_routed_to_no_expert(dist_init, monkeypatch):
+    """The rows the forward context marks as padding (CUDA graph and
+    data-parallel padding) get expert id -1, which FusedMoE skips, as from
+    its own routers; the other rows keep their experts and weights."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.forward_context import set_forward_context
+    from vllm.models.inkling2.configs import Inkling2ModelConfig
+
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    vllm_config = VllmConfig()
+    # A cap of 0 is no cap: SiLU, which FusedMoE's CPU experts have (they
+    # have no SiTU). The routing does not depend on the activation.
+    config = Inkling2ModelConfig(
+        hidden_size=HIDDEN,
+        intermediate_size=INTER,
+        n_routed_experts=NUM_EXPERTS,
+        num_experts_per_tok=TOPK,
+        mlp_gate_softcap=0.0,
+        mlp_up_softcap=0.0,
+    )
+    with set_current_vllm_config(vllm_config):
+        moe = Inkling2BF16MoE(config, "model.layers.0.mlp")
     torch.manual_seed(0)
     moe.gate.bias.data.normal_()
     logits = torch.randn(5, NUM_EXPERTS)
     is_padding = torch.tensor([False, False, True, False, True])
-    monkeypatch.setattr(
-        bf16_moe, "get_moe_padding_mask", lambda num_tokens: is_padding[:num_tokens]
-    )
 
-    weights, ids = kwargs["custom_routing_function"](
-        hidden_states=None, gating_output=logits, topk=TOPK, renormalize=False
-    )
+    with set_forward_context(None, vllm_config, is_padding=is_padding):
+        weights, ids = moe.experts.router.select_experts(
+            hidden_states=torch.empty(5, 0), router_logits=logits
+        )
 
-    ref_weights, ref_ids = route(logits, moe.gate.bias, TOPK, CONFIG.route_scale)
-    assert torch.equal(ids[~is_padding], ref_ids[~is_padding])
-    assert (ids[is_padding] == -1).all()
-    assert torch.equal(weights, ref_weights)
+    ref_weights, ref_ids = route(logits, moe.gate.bias, TOPK, config.route_scale)
+    assert torch.equal(ids.long(), ref_ids.masked_fill(is_padding[:, None], -1))
+    assert torch.equal(weights[~is_padding], ref_weights[~is_padding])
 
 
 # Softcaps of the GPU tests. Their pre-activations stay below 4.5, where the
@@ -392,28 +406,31 @@ def test_bf16_moe_matches_reference(num_tokens, dist_init, workspace_init):
 @pytest.mark.parametrize(("num_tokens", "num_real"), [(8, 3), (300, 256)])
 @torch.inference_mode()
 def test_bf16_moe_padding_leaves_the_other_rows_unchanged(
-    num_tokens, num_real, dist_init, workspace_init
+    num_tokens, num_real, dist_init, workspace_init, monkeypatch
 ):
     """Rows the forward context marks as padding (CUDA graph and
-    data-parallel padding) go to no expert. The rows before them come out as
-    they do without it; the padding rows only have to differ from it: without
-    an expert map they hold whatever FusedMoE's workspace held."""
-    _, _, _, forward = _gpu_layer()
+    data-parallel padding) reach FusedMoE's experts with expert id -1, which
+    they skip; the rows before them keep their experts and come out as they
+    do without the mask. What a padding row comes out as is not specified:
+    without an expert map, the sum of what FusedMoE's workspace held."""
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    moe, _, _, forward = _gpu_layer()
+    # The expert ids of each forward, as the router hands them to the experts.
+    routed: list[torch.Tensor] = []
+    moe.experts.router.set_capture_fn(lambda topk_ids: routed.append(topk_ids.clone()))
     x = (torch.randn(num_tokens, HIDDEN) * 0.5).bfloat16().cuda()
     is_padding = (torch.arange(num_tokens) >= num_real).cuda()
 
     expected = forward(x)
-    # FusedMoE writes nothing for a row that goes to no expert and sums what
-    # its workspace holds there, which would be the right values left by the
-    # run above: overwrite them, so a real row that got skipped comes out
-    # wrong.
+    # Overwrite FusedMoE's workspace, so that a skipped real row comes out wrong.
     forward(-x)
     out = forward(x, is_padding)
 
-    # Each row is computed on its own, so the real rows should be equal; the
-    # tolerance, a few bf16 steps and far below what a skipped row is off by,
-    # allows for a kernel that orders a row's sums by the batch.
-    torch.testing.assert_close(out[:num_real], expected[:num_real], rtol=0, atol=5e-2)
-    # The mask took effect: no padding row was computed.
-    computed = (out[num_real:] == expected[num_real:]).all(dim=1)
-    assert not computed.any(), computed.nonzero().flatten().tolist()
+    ids, _, padded_ids = routed
+    assert (ids >= 0).all()
+    torch.testing.assert_close(
+        padded_ids, ids.masked_fill(is_padding[:, None], -1), rtol=0, atol=0
+    )
+    # Exact: the kernels' tile sizes follow the number of rows, the same in
+    # both runs, and a row's result does not depend on the other rows.
+    torch.testing.assert_close(out[:num_real], expected[:num_real], rtol=0, atol=0)

@@ -11,14 +11,20 @@ import torch
 from tests.models.inkling2.test_attention import shear_rel_logits
 from vllm.models.inkling2.ops.attn_res import attn_res
 from vllm.models.inkling2.ops.conv_mix import conv_mix
+from vllm.models.inkling2.ops.linear import linear_k_groups
 from vllm.models.inkling2.ops.norm import rms_norm
 from vllm.models.inkling2.ops.sconv import (
     attention_prologue,
     shift_rel_proj,
     short_conv,
 )
+from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+requires_sm100 = pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="the fused conv + mix kernel is built for SM100 only",
+)
 
 DEVICE = "cuda"
 
@@ -298,6 +304,7 @@ def test_short_conv_reads_the_cache_next_to_padding_rows(num_reqs):
     when none of their tokens starts a request. The padding rows (no cache
     slot, request 0, request start 0) must not make the tile they share with
     the last decode tokens skip it."""
+    torch.manual_seed(0)
     width, block, heads, stream_width, offset, row = 4, 4, 2, 128, 128, 1024
     channels = heads * stream_width
     cached, padded = 6, 300
@@ -353,6 +360,7 @@ def test_short_conv_reads_the_cache_next_to_padding_rows(num_reqs):
     torch.testing.assert_close(out[:num_reqs], ref, atol=0, rtol=1e-2)
 
 
+@requires_sm100
 @pytest.mark.parametrize(
     "num_stack,num_q,with_last,with_residual",
     [
@@ -503,3 +511,23 @@ def test_attention_prologue_writes_clipped_k_and_normed_v(dynamic):
     num_tokens = sum(totals)
     assert (kv != 0).any(-1).sum() == num_tokens * heads
     assert (cache[..., : 2 * dim] != 0).any(-1).sum() == num_tokens * heads
+
+
+@pytest.mark.parametrize("tokens", [8, 100, 4000, 4100])
+def test_linear_k_groups_projects_the_dynamic_taps(tokens: int):
+    """The call of `Inkling2ShortConv.dynamic_taps` at TP 1, the kernel's
+    only caller off Blackwell: 32 output columns (no more than one column
+    tile), bf16 out. Off Blackwell the kernel also takes the batches of 2048
+    rows and more: split over K below 4096 rows, the K groups summed in one
+    program from there."""
+    torch.manual_seed(0)
+    x = torch.randn(tokens, 4608, device=DEVICE).bfloat16()
+    w = (torch.randn(32, 4608, device=DEVICE) * 0.02).bfloat16()
+    out = linear_k_groups(x, w, torch.bfloat16)
+    assert out.dtype == torch.bfloat16
+    # The fp32 sum is rounded to nearest once: half a bf16 step, 2**-8
+    # relative. The absolute term is for the fp32 accumulation of the 4608
+    # products, which the tensor cores round in an unspecified way.
+    torch.testing.assert_close(
+        out.double(), x.double() @ w.double().T, rtol=2**-8, atol=1e-4
+    )

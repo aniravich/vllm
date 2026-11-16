@@ -7,7 +7,7 @@ loaded from a synthetic checkpoint in the release's names and shapes: every
 parameter is compared with the slice of the checkpoint its rank owns. Weight
 updates then go through vLLM's reload functions, in both reload modes: they
 have to land in the same storage, survive a retry after an interrupted
-update, and be refused when they deliver only part of a module.
+update, and leave untouched what they are not sent.
 """
 
 import random
@@ -29,6 +29,7 @@ from vllm.model_executor.model_loader.reload import (
     start_reload,
 )
 from vllm.model_executor.model_loader.utils import process_weights_after_loading
+from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.cpu_test
 
@@ -239,6 +240,10 @@ def build_model(gluon, dist_init, monkeypatch, vllm_config):
     from vllm.models.inkling2.model import Inkling2ForConditionalGeneration
     from vllm.utils.torch_utils import set_default_torch_dtype
 
+    # The model is refused by the host's GPU family, whatever it is built on.
+    capability = current_platform.get_device_capability()
+    if capability is not None and capability.major not in (9, 10):
+        pytest.skip("Inkling2 is refused on this GPU family")
     # FusedMoE's CPU experts have no SiTU and repack their weights after
     # loading. Loading does not depend on the activation, and the Triton
     # experts Inkling2 runs on keep the checkpoint's layout.
@@ -351,10 +356,10 @@ def _update_per_tensor(model, model_config, weights) -> set[str]:
 
 
 def _update_one_call(model, model_config, weights) -> set[str]:
-    """A weight update as a worker that drives the layerwise reload itself
-    delivers it (prime-rl's inference worker): the whole stream to one
-    `load_weights` call, with `weight_update_active()` false. Returns the
-    parameters the call reported."""
+    """A weight update through the low-level layerwise API
+    (`docs/training/layerwise.md`): the whole stream to one `load_weights`
+    call, with `weight_update_active()` false. Returns the parameters the
+    call reported."""
     initialize_layerwise_reload(model)
     loaded = model.load_weights(weights)
     finalize_layerwise_reload(model, model_config)
@@ -619,4 +624,23 @@ def test_dspark_draft_needs_blackwell(off_blackwell, build_model, vllm_config):
     )
 
     with pytest.raises(ValueError, match="DSpark draft needs a Blackwell GPU"):
+        build_model()
+
+
+@pytest.mark.parametrize("capability", [(8, 9), (12, 0)])
+def test_other_gpu_families_are_refused(
+    off_blackwell, build_model, monkeypatch, capability
+):
+    """Off Blackwell only Hopper is served: the other families have no
+    attention path."""
+    import vllm.models.inkling2.model as model_module
+    from vllm.platforms.interface import DeviceCapability
+
+    monkeypatch.setattr(
+        model_module.current_platform,
+        "get_device_capability",
+        lambda: DeviceCapability(*capability),
+    )
+
+    with pytest.raises(ValueError, match="this GPU has compute capability"):
         build_model()

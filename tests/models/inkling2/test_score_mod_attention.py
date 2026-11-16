@@ -25,10 +25,11 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import gl
 
 _cap = current_platform.get_device_capability() if current_platform.is_cuda() else None
-# Standard FA4 takes a score-mod with paged KV on SM90, SM100 and SM110 only.
+# Inkling2 serves Hopper and Blackwell; standard FA4 takes the score-mod with
+# paged KV on both.
 requires_sm90 = pytest.mark.skipif(
-    _cap is None or _cap.major not in (9, 10, 11),
-    reason="FA4 score-mod with paged KV requires SM90, SM100 or SM110",
+    _cap is None or _cap.major not in (9, 10),
+    reason="FA4 score-mod with paged KV requires SM90 or SM100",
 )
 # `vllm.models.inkling2.attention` builds its Gluon kernels at import, which
 # vLLM's Triton placeholders (a host without an active GPU driver) cannot.
@@ -153,7 +154,6 @@ def _dense_fa4(
     softmax_scale,
     window_size,
     out,
-    pack_gqa=False,
 ):
     """CPU stand-in for `fa4_rel_attention`: the fp32 reference on the
     logits by distance. Like FA4 it leaves rows past `cu_seqlens_q[-1]`
@@ -276,7 +276,6 @@ def test_score_mod_attention_zeroes_padding_rows(monkeypatch, graph, window_left
 
 
 @requires_sm90
-@pytest.mark.parametrize("pack_gqa", [False, True])
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,block_size,window_left,scenario",
     [
@@ -298,9 +297,7 @@ def test_score_mod_attention_zeroes_padding_rows(monkeypatch, graph, window_left
     ],
 )
 @torch.inference_mode()
-def test_fa4_rel_attention(
-    num_heads, num_kv_heads, block_size, window_left, scenario, pack_gqa
-):
+def test_fa4_rel_attention(num_heads, num_kv_heads, block_size, window_left, scenario):
     """Prologue-layout logits -> un-shear -> standard FA4 with the score-mod
     matches the fp32 reference, output and LSE."""
     torch.manual_seed(0)
@@ -342,7 +339,6 @@ def test_fa4_rel_attention(
         softmax_scale=scale,
         window_size=(-1, -1) if window_left is None else (window_left, 0),
         out=out,
-        pack_gqa=pack_gqa,
     )
 
     ref_out, ref_lse = _ref_attention(
