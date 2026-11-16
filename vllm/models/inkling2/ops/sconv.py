@@ -338,9 +338,12 @@ def _sconv_kernel(
         tl.extra.cuda.gdc_wait()
         # Request starts are non-decreasing: no token of the tile is among the
         # first W - 1 of its request unless the last token's request starts
-        # after first - (W - 1).
+        # after first - (W - 1). Padding rows (no cache slot) carry no request
+        # start: a tile that ends in one reads the cache per token.
         last = tl.minimum(first + BT, T) - 1
-        tile_reads_cache = tl.load(qstart_ptr + last) > first - (W - 1)
+        tile_reads_cache = (tl.load(qstart_ptr + last) > first - (W - 1)) | (
+            tl.load(slot_ptr + last) < 0
+        )
     toff = first + tl.arange(0, BT)
     coff = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     C = H * WS

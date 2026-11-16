@@ -11,14 +11,20 @@ import torch
 from tests.models.inkling2.test_attention import shear_rel_logits
 from vllm.models.inkling2.ops.attn_res import attn_res
 from vllm.models.inkling2.ops.conv_mix import conv_mix
+from vllm.models.inkling2.ops.linear import linear_k_groups
 from vllm.models.inkling2.ops.norm import rms_norm
 from vllm.models.inkling2.ops.sconv import (
     attention_prologue,
     shift_rel_proj,
     short_conv,
 )
+from vllm.platforms import current_platform
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+requires_sm100 = pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="the fused conv + mix kernel is built for SM100 only",
+)
 
 DEVICE = "cuda"
 
@@ -291,6 +297,70 @@ def test_short_conv_chunked_matches_full_sequence(fused_residual, steps):
         torch.testing.assert_close(torch.cat(outs[i]), ref, atol=0, rtol=1e-2)
 
 
+@pytest.mark.parametrize("num_reqs", [5, 6, 7, 8, 37])
+def test_short_conv_reads_the_cache_next_to_padding_rows(num_reqs):
+    """A decode batch padded past 256 rows (CUDA graph or data-parallel
+    padding) takes the prefill tiling, whose tiles skip the conv-state cache
+    when none of their tokens starts a request. The padding rows (no cache
+    slot, request 0, request start 0) must not make the tile they share with
+    the last decode tokens skip it."""
+    torch.manual_seed(0)
+    width, block, heads, stream_width, offset, row = 4, 4, 2, 128, 128, 1024
+    channels = heads * stream_width
+    cached, padded = 6, 300
+    xs = torch.randn(num_reqs, cached + 1, channels, device=DEVICE).bfloat16()
+    weight = torch.randn(channels, width, device=DEVICE).bfloat16()
+    blocks_per_req = 4
+    num_blocks = num_reqs * blocks_per_req
+    cache = torch.zeros(num_blocks + 1, heads, block, row, device=DEVICE).bfloat16()
+    block_table = (torch.randperm(num_blocks, device=DEVICE) + 1).int()
+    block_table = block_table.view(num_reqs, blocks_per_req)
+    reqs = torch.arange(num_reqs, device=DEVICE)
+
+    # The first `cached` tokens of every request, in one forward.
+    positions = torch.arange(cached, device=DEVICE).repeat(num_reqs)
+    seq_idx = reqs.repeat_interleave(cached)
+    slots = block_table[seq_idx, positions // block].long() * block + positions % block
+    short_conv(
+        xs[:, :cached].reshape(-1, channels),
+        weight,
+        cache,
+        positions,
+        block_table,
+        seq_idx.int(),
+        slots,
+        (seq_idx * cached).int(),
+        offset,
+        stream_width,
+    )
+
+    # One decode token per request, then padding rows.
+    x = torch.zeros(padded, channels, device=DEVICE).bfloat16()
+    x[:num_reqs] = xs[:, cached]
+    positions = torch.zeros(padded, dtype=torch.long, device=DEVICE)
+    positions[:num_reqs] = cached
+    seq_idx = torch.zeros(padded, dtype=torch.int32, device=DEVICE)
+    seq_idx[:num_reqs] = reqs
+    slots = torch.full((padded,), -1, dtype=torch.long, device=DEVICE)
+    slots[:num_reqs] = block_table[:, cached // block].long() * block + cached % block
+    out = short_conv(
+        x,
+        weight,
+        cache,
+        positions,
+        block_table,
+        seq_idx,
+        slots,
+        seq_idx.clone(),
+        offset,
+        stream_width,
+    )
+
+    ref = torch.stack([_dense_conv(xs[i], weight, None)[cached] for i in reqs])
+    torch.testing.assert_close(out[:num_reqs], ref, atol=0, rtol=1e-2)
+
+
+@requires_sm100
 @pytest.mark.parametrize(
     "num_stack,num_q,with_last,with_residual",
     [
@@ -441,3 +511,23 @@ def test_attention_prologue_writes_clipped_k_and_normed_v(dynamic):
     num_tokens = sum(totals)
     assert (kv != 0).any(-1).sum() == num_tokens * heads
     assert (cache[..., : 2 * dim] != 0).any(-1).sum() == num_tokens * heads
+
+
+@pytest.mark.parametrize("tokens", [8, 100, 4000, 4100])
+def test_linear_k_groups_projects_the_dynamic_taps(tokens: int):
+    """The call of `Inkling2ShortConv.dynamic_taps` at TP 1, the kernel's
+    only caller off Blackwell: 32 output columns (no more than one column
+    tile), bf16 out. Off Blackwell the kernel also takes the batches of 2048
+    rows and more: split over K below 4096 rows, the K groups summed in one
+    program from there."""
+    torch.manual_seed(0)
+    x = torch.randn(tokens, 4608, device=DEVICE).bfloat16()
+    w = (torch.randn(32, 4608, device=DEVICE) * 0.02).bfloat16()
+    out = linear_k_groups(x, w, torch.bfloat16)
+    assert out.dtype == torch.bfloat16
+    # The fp32 sum is rounded to nearest once: half a bf16 step, 2**-8
+    # relative. The absolute term is for the fp32 accumulation of the 4608
+    # products, which the tensor cores round in an unspecified way.
+    torch.testing.assert_close(
+        out.double(), x.double() @ w.double().T, rtol=2**-8, atol=1e-4
+    )

@@ -12,6 +12,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from vllm.platforms import current_platform
+
+if not current_platform.is_device_capability_family(100):
+    pytest.skip("Inkling2's all-reduce requires Blackwell", allow_module_level=True)
+
 DIM, BLOCK, HEADS, OFFSET = 4608, 16, 2, 256
 WIDTH = DIM // HEADS
 

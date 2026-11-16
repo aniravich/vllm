@@ -28,6 +28,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.reload import weight_update_active
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
@@ -42,6 +43,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderCudaGraphCaptureInputs,
@@ -51,6 +53,7 @@ from vllm.v1.worker.encoder_cudagraph_defs import (
 )
 
 from .attention import Inkling2Attention
+from .bf16_moe import Inkling2BF16MoE
 from .configs import Inkling2MMConfig, Inkling2ModelConfig
 from .lora import (
     LORA_NAME_PREFIXES,
@@ -58,10 +61,11 @@ from .lora import (
     PACKED_MODULES_MAPPING,
 )
 from .lora import register as register_lora
-from .moe import Inkling2MoE, QuantFormat
+from .moe import Inkling2MoE
 from .ops.allreduce import Inkling2AllReduceWorkspace
 from .ops.attention import compute_log_scaling_tau
 from .ops.attn_res import attn_res
+from .ops.device import is_blackwell
 from .ops.norm import rms_norm
 from .ops.seq_parallel import SeqParallel
 from .processing import (
@@ -70,7 +74,7 @@ from .processing import (
     Inkling2MultiModalProcessor,
     Inkling2ProcessingInfo,
 )
-from .quant_config import Inkling2QuantConfig
+from .quant_config import ExpertFormat, Inkling2QuantConfig
 from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ShortConv, conv_metadata
 from .vision import Inkling2VisionEncoder, VisionMetadata
 
@@ -168,12 +172,14 @@ class Inkling2DecoderLayer(nn.Module):
             config.hidden_size, eps, num_inputs=self.num_attn_inputs
         )
         self.mlp_norm = Inkling2RMSNorm(config.hidden_size, eps)
-        expert_format: QuantFormat = (
-            "mxfp8"
-            if quant_config is not None and quant_config.is_mxfp8_layer(layer_id)
-            else "nvfp4"
-        )
-        self.mlp = Inkling2MoE(config, expert_format)
+        expert_format: ExpertFormat = "nvfp4"
+        if quant_config is not None:
+            expert_format = quant_config.expert_format(layer_id)
+        self.mlp: Inkling2MoE | Inkling2BF16MoE
+        if expert_format == "bf16":
+            self.mlp = Inkling2BF16MoE(config, f"{prefix}.mlp")
+        else:
+            self.mlp = Inkling2MoE(config, expert_format)
         self.attn_sconv, self.mlp_sconv = (
             Inkling2ShortConv(
                 config.hidden_size, config.sconv_kernel_size, self.conv_state, stream
@@ -223,9 +229,12 @@ class Inkling2Model(nn.Module):
         if get_tensor_model_parallel_world_size() > 1:
             assert self.normalize_values
             group = get_tp_group().cpu_group
-            self.allreduce_workspace = Inkling2AllReduceWorkspace.create(
-                group, config.hidden_size
-            )
+            # The fused all-reduce and sequence-parallel paths take the MoE
+            # output unreduced; bf16 experts (FusedMoE) reduce it themselves.
+            if not any(isinstance(layer.mlp, Inkling2BF16MoE) for layer in self.layers):
+                self.allreduce_workspace = Inkling2AllReduceWorkspace.create(
+                    group, config.hidden_size
+                )
             if self.allreduce_workspace is not None:
                 vllm_config = get_current_vllm_config()
                 spec = vllm_config.speculative_config
@@ -498,11 +507,32 @@ class Inkling2ForConditionalGeneration(
             raise ValueError("Inkling2 does not support prompt embeddings")
         self.config = config
         self.text_config = text_config = config.text_config
+        mm_config = vllm_config.model_config.multimodal_config
+        vision_config = config.vision_config
+        if mm_config is None or not mm_config.get_limit_per_prompt("image"):
+            vision_config = None
+        speculative = vllm_config.speculative_config
+        if not is_blackwell():
+            capability = current_platform.get_device_capability()
+            if capability is not None and capability.major != 9:
+                raise ValueError(
+                    "Inkling2 runs on Blackwell (SM100) GPUs and, with bf16 "
+                    "routed experts, on Hopper (SM90) GPUs; this GPU has compute "
+                    f"capability {capability.major}.{capability.minor}"
+                )
+            # The vision tower and the DSpark draft have SM100-only attention.
+            if vision_config is not None:
+                raise ValueError(
+                    "Inkling2's vision tower needs a Blackwell GPU (SM100): pass "
+                    "--limit-mm-per-prompt '{\"image\": 0}' to serve text only"
+                )
+            if speculative is not None and speculative.method == "dspark":
+                raise ValueError(
+                    "Inkling2's DSpark draft needs a Blackwell GPU (SM100)"
+                )
         self.visual = (
-            Inkling2VisionEncoder(config.vision_config, text_config.hidden_size)
-            if config.vision_config is not None
-            and vllm_config.model_config.multimodal_config is not None
-            and vllm_config.model_config.multimodal_config.get_limit_per_prompt("image")
+            Inkling2VisionEncoder(vision_config, text_config.hidden_size)
+            if vision_config is not None
             else None
         )
         self.model = Inkling2Model(text_config, quant_config, f"{prefix}model")
@@ -688,6 +718,12 @@ class Inkling2ForConditionalGeneration(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
+        # bf16 experts take their stacked checkpoint tensors themselves.
+        bf16_mlps = {
+            f"model.layers.{i}.mlp": layer.mlp
+            for i, layer in enumerate(self.model.layers)
+            if isinstance(layer.mlp, Inkling2BF16MoE)
+        }
         num_layers = self.text_config.num_hidden_layers
         # Truncated models (e.g. fewer layers via hf_overrides) skip the rest.
         layer_limits = {
@@ -705,6 +741,13 @@ class Inkling2ForConditionalGeneration(
                 continue
             for old, new in self._renames:
                 name = name.replace(old, new)
+            mlp_name, _, expert_tensor = name.partition(".experts.")
+            if mlp_name in bf16_mlps:
+                mlp = bf16_mlps[mlp_name]
+                loaded.add(
+                    f"{mlp_name}.{mlp.load_expert_weight(expert_tensor, weight)}"
+                )
+                continue
             shard_id = None
             for old, (new, shard) in self._shards.items():
                 if old in name:
@@ -718,7 +761,8 @@ class Inkling2ForConditionalGeneration(
                 if m is not None and int(m.group(2)) >= layer_limits[m.group(1)]:
                     continue
                 raise ValueError(f"Unexpected checkpoint tensor: {name}")
-            param = params[name]
+            # Re-read per tensor: a layerwise reload swaps parameters mid-load.
+            param = self.get_parameter(name)
             if param.dtype != weight.dtype:
                 raise ValueError(
                     f"{name}: checkpoint dtype {weight.dtype} != {param.dtype}"
@@ -732,14 +776,23 @@ class Inkling2ForConditionalGeneration(
             else:
                 loader(param, weight, shard_id)
                 loaded_shards.add((name, shard_id))
+        # A weight update delivers the checkpoint over several calls.
+        updating = weight_update_active()
         num_shards = Counter(new for new, _ in self._shards.values())
         for name, count in Counter(name for name, _ in loaded_shards).items():
             fused = next(f for f in num_shards if f in name)
-            if count == num_shards[fused]:
+            if updating or count == num_shards[fused]:
                 loaded.add(name)
         if self.visual is not None:
+            if visual_weights and any(p.is_meta for p in self.visual.parameters()):
+                # The tower's loader does not go through the layerwise wrappers.
+                raise ValueError(
+                    "Inkling2's vision tower cannot be updated by a layerwise "
+                    "reload: leave model.visual.* out of the update, or set "
+                    "VLLM_RELOAD_MODE=direct"
+                )
             loaded |= {f"visual.{n}" for n in self.visual.load_weights(visual_weights)}
-        if missing := params.keys() - loaded:
+        if not updating and (missing := params.keys() - loaded):
             raise ValueError(f"Missing checkpoint tensors: {sorted(missing)}")
         return loaded
 

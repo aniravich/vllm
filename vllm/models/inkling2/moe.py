@@ -24,6 +24,7 @@ from vllm.model_executor.utils import set_weight_attrs
 
 from .ops.activation import swiglu_quantize
 from .ops.block_scales import shuffle_rows, swizzle_block_scales
+from .ops.device import is_blackwell
 from .ops.moe import NUM_COUNTERS, combine, combine_push, route
 from .ops.seq_parallel import SeqParallel
 from .ops.trtllm_bmm import bmm, expert_plan, load_kernels
@@ -36,8 +37,9 @@ class ExpertsLoRA(Protocol):
     for an experts implementation over expert-sorted rows: row `r` is token
     `perm[r] // topk`, and this rank's experts own rows
     `[offsets[0], offsets[-1])`. The NVFP4 / MXFP8 experts here (tile-padded
-    rows, quantized activations) do not support it; the BF16 experts a model
-    may plug in instead (SkyRL's `Inkling2BF16Experts`) do.
+    rows, quantized activations) do not support it; experts a model may plug
+    in instead (SkyRL's `Inkling2BF16Experts`) do. The in-tree bf16 experts
+    (`Inkling2BF16MoE`, on FusedMoE) do not go through this protocol.
     """
 
     def add_w13(
@@ -84,6 +86,13 @@ class Inkling2Gate(nn.Module):
 class Inkling2Experts(nn.Module):
     def __init__(self, config, quant_format: QuantFormat) -> None:
         super().__init__()
+        if not is_blackwell():
+            raise ValueError(
+                f"Inkling2 {quant_format} experts need a Blackwell GPU (SM100). "
+                "Hopper (SM90) serves checkpoints whose routed experts are bf16: "
+                "hf_quant_config.json lists their w13_weight / w2_weight "
+                "under compute_dtype bfloat16."
+            )
         self.ep_rank = get_tensor_model_parallel_rank()
         self.ep_size = get_tensor_model_parallel_world_size()
         assert config.n_routed_experts % self.ep_size == 0
@@ -265,8 +274,8 @@ class Inkling2MoE(nn.Module):
         push; the NVFP4 / MXFP8 experts here do not support it."""
         if lora is not None:
             raise NotImplementedError(
-                "Inkling2 expert LoRA needs BF16 experts; the NVFP4 / MXFP8 "
-                "experts do not support it"
+                "Inkling2 expert LoRA needs plug-in experts that support "
+                "ExpertsLoRA; the NVFP4 / MXFP8 experts do not"
             )
         x = x.contiguous()
         gate, experts = self.gate, self.experts

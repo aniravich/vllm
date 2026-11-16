@@ -23,9 +23,12 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
-from vllm.model_executor.utils import set_weight_attrs
+from vllm.model_executor.utils import refill_derived, set_weight_attrs
 from vllm.models.inkling.nvidia.ops.fa4_rel_attention import bucket_max_seqlen_q
-from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
+from vllm.models.inkling.nvidia.sconv_swa_attn import (
+    InklingConvState,
+    InklingSconvMetadata,
+)
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -53,6 +56,12 @@ from .ops.attention import (
     plan_decode_attention,
     rel_decode_attention,
 )
+from .ops.device import is_blackwell
+from .ops.fa4_rel_attention import (
+    diagonal_offsets,
+    fa4_rel_attention,
+    unshear_rel_logits,
+)
 from .ops.linear import linear
 from .ops.sconv import attention_prologue, shift_rel_proj
 from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
@@ -63,6 +72,9 @@ class Inkling2AttentionMetadata(FlashAttentionMetadata):
     # Host copies for planning FA4 splits (exact for prefill requests).
     query_lens_cpu: np.ndarray = field(default_factory=lambda: np.empty(0, np.int64))
     seq_lens_cpu: np.ndarray = field(default_factory=lambda: np.empty(0, np.int64))
+    # `diagonal_offsets` of the batch's tokens, computed by the first layer
+    # that un-shears relative logits for standard FA4.
+    rel_offsets: torch.Tensor | None = None
 
 
 class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -72,6 +84,9 @@ class Inkling2AttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+        # No Inkling2 kernel takes FA3's ahead-of-time schedule, which the
+        # base builder would compute for every batch on Hopper.
+        self.aot_schedule = False
 
     def build(
         self,
@@ -133,6 +148,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         assert num_heads % tp_size == 0 and num_kv_heads % tp_size == 0
+        self.tp_rank = tp_rank
         self.num_heads = num_heads // tp_size
         self.num_kv_heads = num_kv_heads // tp_size
         self.scaling = self.head_dim**-0.5
@@ -169,6 +185,15 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             bias=False,
             prefix=f"{prefix}.qkvr",
         )
+        if pad_size:
+            # No checkpoint tensor fills the alignment rows: zero and exclude
+            # them from what a load delivers.
+            weight = self.qkvr.weight
+            weight.data[-pad_size:].zero_()
+            set_weight_attrs(
+                weight, {"weight_loader_numel": weight[:-pad_size].numel()}
+            )
+            self.qkvr.shard_ids = self.qkvr.shard_ids[:-1]
         self.wo_ud = RowParallelLinear(
             q_size * tp_size,
             config.hidden_size,
@@ -186,14 +211,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             torch.empty(self.num_heads, self.d_rel), requires_grad=False
         )
         for param in (self.q_scale, self.r_scale):
-            set_weight_attrs(
-                param,
-                {
-                    "weight_loader": lambda p, w: p.data.copy_(
-                        w.narrow(0, tp_rank * p.shape[0], p.shape[0])
-                    )
-                },
-            )
+            set_weight_attrs(param, {"weight_loader": self._load_scale})
 
         self.conv_state = conv_state
         self.k_sconv, self.v_sconv = (
@@ -216,11 +234,21 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if prefix in forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         forward_context[prefix] = self
-        if vllm_config.kernel_config.enable_jit_warmup:
+        if is_blackwell() and vllm_config.kernel_config.enable_jit_warmup:
             _INKLING2_FA4_REL_ATTENTION_KERNEL.register_warmup()
 
+    def _load_scale(self, param: nn.Parameter, loaded: torch.Tensor) -> None:
+        """This rank's heads of a per-head L2-clip scale."""
+        size = param.shape[0]
+        param.data.copy_(loaded.narrow(0, self.tp_rank * size, size))
+
     def process_weights_after_loading(self) -> None:
-        self.rel_proj_shifted = shift_rel_proj(self.rel_logits_proj, self.is_local)
+        # Refilled in place: captured CUDA graphs read it.
+        refill_derived(
+            self,
+            "rel_proj_shifted",
+            shift_rel_proj(self.rel_logits_proj, self.is_local),
+        )
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return Inkling2AttentionBackend
@@ -337,7 +365,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         if isinstance(attn_metadata, dict) and self.kv_cache.numel() > 0:
             md = cast(Inkling2AttentionMetadata, attn_metadata[self.prefix])
         num_decodes, num_decode_tokens, decode_splits = 0, 0, 0
-        if md is not None:
+        if md is not None and is_blackwell():
             num_decodes, num_decode_tokens, decode_splits = self._plan_decode(
                 md, num_tokens
             )
@@ -381,6 +409,12 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 rel_threshold=self.rel_clip,
                 norm_eps=self.eps,
             )
+            if not is_blackwell():
+                # tml_fa4's sheared bias and the decode kernels are SM100
+                # only: standard FA4 serves every token of the batch.
+                out, lse = self._score_mod_attention(md, conv_md, clipped_q, rel_logits)
+                gate_sink(out, gate, lse.t(), sinks, output)
+                return
         if decode_splits:
             assert md is not None
             self._decode_attention(
@@ -427,6 +461,49 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
                 sinks[num_decode_tokens:],
                 output[num_decode_tokens:],
             )
+
+    def _score_mod_attention(
+        self,
+        md: Inkling2AttentionMetadata,
+        conv_md: InklingSconvMetadata,
+        q: torch.Tensor,
+        rel_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attention of the whole batch on standard FA4, which reads the
+        relative logits by distance. Returns `(out, lse)` as `gate_sink`
+        takes them: bf16 `(T, H, D)` and fp32 `(H, T)`, zero for CUDA graph
+        padding rows.
+
+        A full CUDA graph captures this, so nothing here reads a tensor on
+        the host: its `num_actual_tokens` includes the padding rows, which
+        only `query_start_loc[-1]` tells apart.
+        """
+        nt = md.num_actual_tokens
+        cu_seqlens_q = md.query_start_loc[: md.seq_lens.shape[0] + 1]
+        if md.rel_offsets is None:
+            md.rel_offsets = diagonal_offsets(
+                conv_md.seq_idx[:nt], cu_seqlens_q, md.seq_lens
+            )
+        key_cache, value_cache = self._split_kv_cache()
+        out = q.new_zeros(q.shape)
+        lse = q.new_zeros((self.num_heads, q.shape[0]), dtype=torch.float32)
+        fa4_lse = fa4_rel_attention(
+            q[:nt],
+            key_cache,
+            value_cache,
+            unshear_rel_logits(rel_logits, md.rel_offsets),
+            block_table=md.block_table,
+            cache_seqlens=md.seq_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_query_len=md.max_query_len,
+            softmax_scale=self.scaling,
+            window_size=self.window_size,
+            out=out[:nt],
+        )
+        # FA4 writes neither output for rows past the batch's tokens.
+        real = torch.arange(nt, device=q.device) < cu_seqlens_q[-1]
+        lse[:, :nt] = torch.where(real, fa4_lse, 0.0)
+        return out, lse
 
     def _plan_decode(
         self, md: FlashAttentionMetadata, num_tokens: int
