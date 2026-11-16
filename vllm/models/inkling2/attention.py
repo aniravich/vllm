@@ -186,9 +186,8 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             prefix=f"{prefix}.qkvr",
         )
         if pad_size:
-            # No checkpoint tensor fills the alignment rows: zero them (so the
-            # weight is the same on every load), and keep them out of the
-            # shards and elements a load is expected to deliver.
+            # No checkpoint tensor fills the alignment rows: zero and exclude
+            # them from what a load delivers.
             weight = self.qkvr.weight
             weight.data[-pad_size:].zero_()
             set_weight_attrs(
@@ -244,8 +243,7 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
         param.data.copy_(loaded.narrow(0, self.tp_rank * size, size))
 
     def process_weights_after_loading(self) -> None:
-        # Refilled in place after a weight update, for the kernels of captured
-        # CUDA graphs that read it.
+        # Refilled in place: captured CUDA graphs read it.
         refill_derived(
             self,
             "rel_proj_shifted",

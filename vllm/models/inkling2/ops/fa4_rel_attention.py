@@ -77,21 +77,15 @@ def fa4_rel_attention(
     softmax_scale: float,
     window_size: tuple[int, int],
     out: torch.Tensor,
-    pack_gqa: bool = False,
 ) -> torch.Tensor:
     """Paged varlen causal attention with the relative bias
     `rel_logits[i, h, i - j]` (0 beyond the extent), over all tokens of the
     batch (prefill and decode alike).
 
-    Writes `out` `(T, H, D)` and returns the natural-log LSE `(H, T)` of the
-    biased, scaled scores; rows past `cu_seqlens_q[-1]` are left unwritten
-    in both. `q` is `(T, H, D)`, `rel_logits` `(T, H, extent)`; the caches
-    are `(num_blocks, block_size, H_kv, D)`.
-
-    Without `pack_gqa` each query head runs as its own row tile, the same
-    kernel structure as without GQA; packing a KV head's query heads into one
-    tile reads its keys once (cheaper for decode) through FA4's packed
-    load/store paths.
+    Writes bf16 `out` `(T, H, D)` and returns the fp32 natural-log LSE
+    `(H, T)` of the biased, scaled scores; rows past `cu_seqlens_q[-1]` are
+    left unwritten in both. `q` is bf16 `(T, H, D)`, `rel_logits` bf16
+    `(T, H, extent)`; the caches are `(num_blocks, block_size, H_kv, D)`.
     """
     from vllm.vllm_flash_attn.cute import flash_attn_varlen_func
 
@@ -108,7 +102,7 @@ def fa4_rel_attention(
         # cute uses (None, None) to mean "no window".
         window_size=(None, None) if window_size == (-1, -1) else window_size,
         num_splits=1,
-        pack_gqa=pack_gqa,
+        pack_gqa=False,
         score_mod=_get_score_mod(rel_logits.shape[2]),
         aux_tensors=[rel_logits.contiguous()],
         return_lse=True,

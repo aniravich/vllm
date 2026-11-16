@@ -12,10 +12,14 @@ Adapters use the checkpoint's names (`model.llm.layers.N...`):
   (`w13` rows interleave gate / up like the base weight), packed into
   `mlp`.
 
-The experts are not a vLLM `FusedMoE`, so `Inkling2MoEWithLoRA` wraps
-the whole `mlp` (vLLM's manager special-cases modules named `*.experts`)
-and adds the deltas between the expert GEMMs through `moe.ExpertsLoRA`,
-which needs BF16 experts (the NVFP4 / MXFP8 ones raise).
+The NVFP4 / MXFP8 experts are not a vLLM `FusedMoE`, so
+`Inkling2MoEWithLoRA` wraps the whole `mlp` (vLLM's manager special-cases
+modules named `*.experts`) and adds the deltas between the expert GEMMs
+through `moe.ExpertsLoRA`, which needs plug-in experts (the NVFP4 / MXFP8
+ones raise). It does not wrap an `mlp` with in-tree bf16 experts
+(`Inkling2BF16MoE`), so expert adapters in this format have no target
+there: those experts are a vLLM `FusedMoE`, which vLLM's manager wraps
+itself (`FusedMoEWithLoRA`).
 
 The attention layers run their GEMMs on `qkvr.weight` / `wo_ud.weight`
 directly (`ops.linear`), past the LoRA wrappers' forward, and add the deltas

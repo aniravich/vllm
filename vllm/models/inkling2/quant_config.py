@@ -48,8 +48,8 @@ class Inkling2QuantConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Standard FA4 takes the relative-bias score-mod from SM90 on. The
-        # NVFP4 / MXFP8 experts need SM100 and check for it themselves.
+        # Hopper (SM90) serves bf16 experts on standard FA4. What needs
+        # Blackwell (SM100) is refused when the model is built.
         return 90
 
     @staticmethod

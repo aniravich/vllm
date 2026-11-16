@@ -3,8 +3,8 @@
 """Inkling2 mixture-of-experts with unquantized (bf16) routed experts, on
 vLLM's FusedMoE.
 
-For checkpoints whose routed experts are bf16: such experts run on any GPU,
-shard over the expert-parallel group (TP x DP) and take in-place weight
+For checkpoints whose routed experts are bf16: such experts need no Blackwell
+kernel, shard over the expert-parallel group (TP x DP) and take in-place weight
 updates. The gate, the selection and the routing weights are the ones of
 `Inkling2MoE`; the experts run without activation quantization, and the
 routing weight multiplies each expert's output instead of its SwiGLU.
@@ -22,13 +22,6 @@ from vllm.model_executor.layers.fused_moe.router.base_router import (
 
 # Stacked checkpoint tensors of the routed experts, under `mlp.experts`.
 _W13, _W2 = "w13_weight", "w2_weight"
-
-
-def router_logits(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """fp32 `x @ weight.T` of bf16 operands, accumulated in fp32."""
-    if x.is_cuda:
-        return torch.mm(x, weight.t(), out_dtype=torch.float32)
-    return torch.mm(x.float(), weight.float().t())
 
 
 def route(
@@ -55,10 +48,9 @@ def route(
 def expert_activation(gate_cap: float, up_cap: float) -> dict[str, Any]:
     """FusedMoE's arguments for Inkling2's expert activation `softcap(gate) *
     sigmoid(gate) * softcap(up)`, where `softcap(x) = cap * tanh(x / cap)`
-    and a cap of 0 is no cap."""
+    and a cap of 0 is no cap: FusedMoE's SiTU, whose `beta` and `linear_beta`
+    are the two caps."""
     if gate_cap > 0:
-        # SiTU is beta * tanh(g / beta) * sigmoid(g) times
-        # linear_beta * tanh(u / linear_beta), or times u without a linear_beta.
         return {
             "activation": "situ",
             "activation_situ_beta": gate_cap,
@@ -73,10 +65,9 @@ def expert_activation(gate_cap: float, up_cap: float) -> dict[str, Any]:
 
 
 class Inkling2BF16Gate(nn.Module):
-    """The gate's parameters, under the checkpoint's names. `Inkling2Gate`
-    also holds the counters of its routing kernels: a buffer that no
-    checkpoint tensor fills would keep a layerwise weight reload from ever
-    seeing this module complete."""
+    """The gate's parameters under the checkpoint's names, without
+    `Inkling2Gate`'s kernel counters: with a buffer no checkpoint tensor
+    fills, a layerwise reload completes the module only when it finalizes."""
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -95,6 +86,7 @@ class Inkling2BF16MoE(nn.Module):
     def __init__(self, config, prefix: str) -> None:
         super().__init__()
         assert config.n_shared_experts == 0
+        self.prefix = prefix
         self.gate = Inkling2BF16Gate(config)
         self.topk = config.num_experts_per_tok
         self.route_scale = config.route_scale
@@ -135,9 +127,10 @@ class Inkling2BF16MoE(nn.Module):
         return weights, ids
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """bf16 [T, H] -> bf16 [T, H], reduced over the expert-parallel
+        """bf16 `[T, H]` -> bf16 `[T, H]`, reduced over the expert-parallel
         group."""
-        logits = router_logits(x, self.gate.weight)
+        # Gate logits of the bf16 operands, accumulated in fp32.
+        logits = torch.mm(x, self.gate.weight.t(), out_dtype=torch.float32)
         return self.experts(hidden_states=x, router_logits=logits)
 
     def load_expert_weight(self, name: str, weight: torch.Tensor) -> str:
@@ -157,15 +150,16 @@ class Inkling2BF16MoE(nn.Module):
             _W13: (self.num_experts, 2 * inter, hidden),
             _W2: (self.num_experts, hidden, inter),
         }
+        full_name = f"{self.prefix}.experts.{name}"
         if name not in shapes:
             raise ValueError(
-                f"Unexpected tensor for bf16 Inkling2 experts: experts.{name} "
+                f"Unexpected tensor for bf16 Inkling2 experts: {full_name} "
                 "(a quantized checkpoint?)"
             )
         dtype = getattr(experts, name).dtype
         if weight.dtype != dtype or weight.shape != shapes[name]:
             raise ValueError(
-                f"experts.{name}: checkpoint {weight.dtype} {tuple(weight.shape)} "
+                f"{full_name}: checkpoint {weight.dtype} {tuple(weight.shape)} "
                 f"!= {dtype} {shapes[name]}"
             )
         expert_map = experts.expert_map_manager.expert_map
@@ -182,19 +176,17 @@ class Inkling2BF16MoE(nn.Module):
             else:
                 shards = (("w2", expert),)
             for shard_id, shard in shards:
-                # Looked up per call: a layerwise weight reload buffers the
-                # calls on a meta parameter, and swaps the real one back in
-                # once the layer is complete.
+                # Re-read per call: a layerwise reload swaps the parameter
+                # mid-load.
                 param = getattr(experts, name)
                 if expert_map is not None and param.is_meta:
-                    # The buffered call would keep the whole stacked tensor
-                    # alive for the share of it this rank owns.
+                    # A buffered call must not pin the whole stacked tensor.
                     shard = shard.clone()
                 # The loader reports a skipped tensor instead of raising.
                 if not param.weight_loader(
                     param, shard, name, shard_id, expert_id, return_success=True
                 ):
                     raise ValueError(
-                        f"experts.{name}: expert {expert_id} ({shard_id}) not loaded"
+                        f"{full_name}: expert {expert_id} ({shard_id}) not loaded"
                     )
         return f"experts.routed_experts.{name}"

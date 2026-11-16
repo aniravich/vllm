@@ -37,8 +37,9 @@ class ExpertsLoRA(Protocol):
     for an experts implementation over expert-sorted rows: row `r` is token
     `perm[r] // topk`, and this rank's experts own rows
     `[offsets[0], offsets[-1])`. The NVFP4 / MXFP8 experts here (tile-padded
-    rows, quantized activations) do not support it; the BF16 experts a model
-    may plug in instead (SkyRL's `Inkling2BF16Experts`) do.
+    rows, quantized activations) do not support it; experts a model may plug
+    in instead (SkyRL's `Inkling2BF16Experts`) do. The in-tree bf16 experts
+    (`Inkling2BF16MoE`, on FusedMoE) do not go through this protocol.
     """
 
     def add_w13(
@@ -88,7 +89,7 @@ class Inkling2Experts(nn.Module):
         if not is_blackwell():
             raise ValueError(
                 f"Inkling2 {quant_format} experts need a Blackwell GPU (SM100). "
-                "Other GPUs serve checkpoints whose routed experts are bf16: "
+                "Hopper (SM90) serves checkpoints whose routed experts are bf16: "
                 "hf_quant_config.json lists their w13_weight / w2_weight "
                 "under compute_dtype bfloat16."
             )
@@ -273,8 +274,8 @@ class Inkling2MoE(nn.Module):
         push; the NVFP4 / MXFP8 experts here do not support it."""
         if lora is not None:
             raise NotImplementedError(
-                "Inkling2 expert LoRA needs BF16 experts; the NVFP4 / MXFP8 "
-                "experts do not support it"
+                "Inkling2 expert LoRA needs plug-in experts that support "
+                "ExpertsLoRA; the NVFP4 / MXFP8 experts do not"
             )
         x = x.contiguous()
         gate, experts = self.gate, self.experts

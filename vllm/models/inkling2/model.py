@@ -43,6 +43,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderCudaGraphCaptureInputs,
@@ -507,15 +508,20 @@ class Inkling2ForConditionalGeneration(
         self.config = config
         self.text_config = text_config = config.text_config
         mm_config = vllm_config.model_config.multimodal_config
-        with_vision = (
-            config.vision_config is not None
-            and mm_config is not None
-            and bool(mm_config.get_limit_per_prompt("image"))
-        )
+        vision_config = config.vision_config
+        if mm_config is None or not mm_config.get_limit_per_prompt("image"):
+            vision_config = None
         speculative = vllm_config.speculative_config
         if not is_blackwell():
+            capability = current_platform.get_device_capability()
+            if capability is not None and capability.major != 9:
+                raise ValueError(
+                    "Inkling2 runs on Blackwell (SM100) GPUs and, with bf16 "
+                    "routed experts, on Hopper (SM90) GPUs; this GPU has compute "
+                    f"capability {capability.major}.{capability.minor}"
+                )
             # The vision tower and the DSpark draft have SM100-only attention.
-            if with_vision:
+            if vision_config is not None:
                 raise ValueError(
                     "Inkling2's vision tower needs a Blackwell GPU (SM100): pass "
                     "--limit-mm-per-prompt '{\"image\": 0}' to serve text only"
@@ -525,8 +531,8 @@ class Inkling2ForConditionalGeneration(
                     "Inkling2's DSpark draft needs a Blackwell GPU (SM100)"
                 )
         self.visual = (
-            Inkling2VisionEncoder(config.vision_config, text_config.hidden_size)
-            if with_vision
+            Inkling2VisionEncoder(vision_config, text_config.hidden_size)
+            if vision_config is not None
             else None
         )
         self.model = Inkling2Model(text_config, quant_config, f"{prefix}model")
@@ -755,8 +761,7 @@ class Inkling2ForConditionalGeneration(
                 if m is not None and int(m.group(2)) >= layer_limits[m.group(1)]:
                     continue
                 raise ValueError(f"Unexpected checkpoint tensor: {name}")
-            # Looked up per tensor: a layerwise weight reload swaps a module's
-            # parameters back in once it is complete.
+            # Re-read per tensor: a layerwise reload swaps parameters mid-load.
             param = self.get_parameter(name)
             if param.dtype != weight.dtype:
                 raise ValueError(
@@ -780,9 +785,7 @@ class Inkling2ForConditionalGeneration(
                 loaded.add(name)
         if self.visual is not None:
             if visual_weights and any(p.is_meta for p in self.visual.parameters()):
-                # The tower's loader writes to its parameters, which a
-                # layerwise reload has replaced by meta ones, all but the
-                # biases: it would end with new biases on old weights.
+                # The tower's loader does not go through the layerwise wrappers.
                 raise ValueError(
                     "Inkling2's vision tower cannot be updated by a layerwise "
                     "reload: leave model.visual.* out of the update, or set "
