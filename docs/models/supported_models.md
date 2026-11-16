@@ -719,20 +719,27 @@ Some models are supported only via the [Transformers modeling backend](#transfor
     - Gemma 4 Unified assistant checkpoints (`model_type: gemma4_unified_assistant`) use the same MTP path as the tower-based variant. See the [Gemma 4 assistant model MTP example](../features/speculative_decoding/mtp.md#gemma-4-assistant-models).
 
 !!! note
-    `Inkling2ForConditionalGeneration` builds each layer's routed experts from the
-    checkpoint's `hf_quant_config.json`. The NVFP4 and MXFP8 experts of
-    `thinkingmachines/Inkling-2-Small` need a Blackwell GPU. Experts listed there under
-    `compute_dtype: bfloat16` run from Hopper (SM90) on and can be updated in place
-    ([Async RL](../training/async_rl.md)). They take about 1.1 TB, so they are served
-    with expert parallelism over 16 GPUs:
-    `--tensor-parallel-size 8 --data-parallel-size 2 --enable-expert-parallel`, with
-    `--nnodes 2 --node-rank <0|1> --master-addr <head node IP>` on each of two 8-GPU
-    nodes and `--headless` on the second
-    ([multi-node deployment](../serving/parallelism_scaling.md#running-vllm-with-multiprocessing)).
-    A weight update sends each layer's stacked expert tensors to every GPU: leave
-    about 25 GiB per GPU free for it, for example with `--gpu-memory-utilization 0.80`
-    on an H200. Off Blackwell only the text path is covered: the vision tower and the
-    DSpark draft are refused, so pass `--limit-mm-per-prompt '{"image": 0}'`.
+    `Inkling2ForConditionalGeneration` runs on Blackwell (SM100) and, with unquantized
+    routed experts, on Hopper (SM90: H100, H200). Other NVIDIA GPU families are refused
+    at startup.
+
+    - The NVFP4 and MXFP8 experts of `thinkingmachines/Inkling-2-Small` need Blackwell.
+    - Hopper serves a checkpoint whose routed experts are bf16: `hf_quant_config.json`
+      (`quant_method: inkling2`) lists each layer's `mlp.experts.w13_weight` and
+      `mlp.experts.w2_weight` in a parameter group with `compute_dtype: bfloat16`, the
+      tensors are bf16 `(E, 2 * I, H)` with interleaved gate / up rows and `(E, H, I)`,
+      and `config.json` has no `quantization_config`.
+    - On Hopper only the text path is covered: the vision tower and the DSpark draft are
+      refused, so pass `--limit-mm-per-prompt '{"image": 0}'`.
+    - bf16 experts take about 1,094 GiB, so they are served with expert parallelism over
+      16 GPUs (`--tensor-parallel-size 8 --data-parallel-size 2 --enable-expert-parallel`),
+      one data-parallel rank per 8-GPU node: see
+      [Expert Parallel Deployment](../serving/expert_parallel_deployment.md#multi-node-deployment).
+    - They can be updated in place ([Weight Transfer](../training/weight_transfer/README.md)).
+      An update sends each layer's stacked expert tensors to every GPU: leave about
+      25 GiB per GPU free for it, for example with `--gpu-memory-utilization 0.80` on an
+      H200.
+    - Expert LoRA adapters in the Inkling 2 format have no target on bf16 experts.
 
 !!! note
     For `InternVLChatModel`, only InternVL2.5 with Qwen2.5 text backbone (`OpenGVLab/InternVL2.5-1B` etc.), InternVL3 and InternVL3.5 have video inputs support currently.
